@@ -1,0 +1,251 @@
+// PayFlow Prisma Schema
+// All monetary values are stored as integers in minor currency units (paise/cents)
+// to avoid floating-point arithmetic errors.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enumerations ────────────────────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum WalletStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum PaymentType {
+  DEPOSIT
+  TRANSFER
+  REVERSAL
+}
+
+enum LedgerEntryType {
+  DEBIT
+  CREDIT
+}
+
+enum OutboxEventStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+enum NotificationStatus {
+  UNREAD
+  READ
+}
+
+// ─── Core Models ─────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  firstName    String   @map("first_name")
+  lastName     String   @map("last_name")
+  role         UserRole @default(USER)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  wallets       Wallet[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+model Wallet {
+  id        String       @id @default(uuid())
+  userId    String       @map("user_id")
+  currency  String       @default("INR") @db.VarChar(3)
+  // Balance is stored in minor units (paise for INR, cents for USD)
+  // e.g. ₹100.50 is stored as 10050
+  balance   BigInt       @default(0)
+  status    WalletStatus @default(ACTIVE)
+  label     String?      // Optional user-defined label, e.g. "Savings"
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sentTransfers    Transfer[]         @relation("SenderWallet")
+  receivedTransfers Transfer[]        @relation("ReceiverWallet")
+  payments         Payment[]
+  ledgerEntries    LedgerEntry[]
+
+  @@index([userId])
+  @@map("wallets")
+}
+
+model Payment {
+  id               String            @id @default(uuid())
+  walletId         String            @map("wallet_id")
+  type             PaymentType
+  status           TransactionStatus @default(PENDING)
+  // Amount in minor currency units
+  amount           BigInt
+  currency         String            @default("INR") @db.VarChar(3)
+  description      String?
+  idempotencyKey   String?           @unique @map("idempotency_key")
+  // Reference to the reversed payment (for REVERSAL type)
+  reversedPaymentId String?          @unique @map("reversed_payment_id")
+  metadata         Json?
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  wallet           Wallet            @relation(fields: [walletId], references: [id])
+  reversedPayment  Payment?          @relation("PaymentReversal", fields: [reversedPaymentId], references: [id])
+  reversalPayment  Payment?          @relation("PaymentReversal")
+  ledgerTransaction LedgerTransaction?
+  outboxEvents     OutboxEvent[]
+
+  @@index([walletId])
+  @@index([idempotencyKey])
+  @@map("payments")
+}
+
+model Transfer {
+  id               String            @id @default(uuid())
+  senderWalletId   String            @map("sender_wallet_id")
+  receiverWalletId String            @map("receiver_wallet_id")
+  status           TransactionStatus @default(PENDING)
+  // Amount in minor currency units
+  amount           BigInt
+  currency         String            @default("INR") @db.VarChar(3)
+  description      String?
+  idempotencyKey   String?           @unique @map("idempotency_key")
+  // Reference to the reversed transfer
+  reversedTransferId String?         @unique @map("reversed_transfer_id")
+  metadata         Json?
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  senderWallet     Wallet            @relation("SenderWallet", fields: [senderWalletId], references: [id])
+  receiverWallet   Wallet            @relation("ReceiverWallet", fields: [receiverWalletId], references: [id])
+  reversedTransfer Transfer?         @relation("TransferReversal", fields: [reversedTransferId], references: [id])
+  reversalTransfer Transfer?         @relation("TransferReversal")
+  ledgerTransaction LedgerTransaction?
+  outboxEvents     OutboxEvent[]
+
+  @@index([senderWalletId])
+  @@index([receiverWalletId])
+  @@index([idempotencyKey])
+  @@map("transfers")
+}
+
+// ─── Double-Entry Ledger ─────────────────────────────────────────────────────
+// Every financial event produces a LedgerTransaction with balanced DEBIT/CREDIT entries.
+// LedgerEntries are immutable — they are never updated or deleted.
+
+model LedgerTransaction {
+  id          String   @id @default(uuid())
+  paymentId   String?  @unique @map("payment_id")
+  transferId  String?  @unique @map("transfer_id")
+  description String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  payment  Payment?      @relation(fields: [paymentId], references: [id])
+  transfer Transfer?     @relation(fields: [transferId], references: [id])
+  entries  LedgerEntry[]
+
+  @@map("ledger_transactions")
+}
+
+model LedgerEntry {
+  id                  String          @id @default(uuid())
+  ledgerTransactionId String          @map("ledger_transaction_id")
+  walletId            String          @map("wallet_id")
+  type                LedgerEntryType
+  // Amount in minor currency units — always positive
+  amount              BigInt
+  currency            String          @default("INR") @db.VarChar(3)
+  // Running balance snapshot after this entry (for audit/reconciliation)
+  balanceAfter        BigInt          @map("balance_after")
+  createdAt           DateTime        @default(now()) @map("created_at")
+
+  ledgerTransaction LedgerTransaction @relation(fields: [ledgerTransactionId], references: [id])
+  wallet            Wallet            @relation(fields: [walletId], references: [id])
+
+  @@index([walletId])
+  @@index([ledgerTransactionId])
+  @@map("ledger_entries")
+}
+
+// ─── Idempotency ─────────────────────────────────────────────────────────────
+// Stores idempotency keys to ensure safe retries.
+
+model IdempotencyRecord {
+  id            String   @id @default(uuid())
+  key           String   @unique
+  // SHA-256 hash of the request payload to detect payload mismatches
+  requestHash   String   @map("request_hash")
+  // Serialized response to replay on retry
+  responseBody  Json     @map("response_body")
+  // HTTP/operation identifier to scope uniqueness
+  operationType String   @map("operation_type")
+  createdAt     DateTime @default(now()) @map("created_at")
+  expiresAt     DateTime @map("expires_at")
+
+  @@index([key])
+  @@map("idempotency_records")
+}
+
+// ─── Transactional Outbox ────────────────────────────────────────────────────
+// Events are written atomically with the database transaction and published
+// to Kafka asynchronously by the outbox processor.
+
+model OutboxEvent {
+  id          String            @id @default(uuid())
+  topic       String
+  key         String?
+  payload     Json
+  status      OutboxEventStatus @default(PENDING)
+  paymentId   String?           @map("payment_id")
+  transferId  String?           @map("transfer_id")
+  attempts    Int               @default(0)
+  lastError   String?           @map("last_error")
+  processedAt DateTime?         @map("processed_at")
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  payment  Payment?  @relation(fields: [paymentId], references: [id])
+  transfer Transfer? @relation(fields: [transferId], references: [id])
+
+  @@index([status, createdAt])
+  @@map("outbox_events")
+}
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+model Notification {
+  id        String             @id @default(uuid())
+  userId    String             @map("user_id")
+  title     String
+  body      String
+  status    NotificationStatus @default(UNREAD)
+  metadata  Json?
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime           @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@map("notifications")
+}
